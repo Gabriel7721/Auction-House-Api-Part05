@@ -76,7 +76,7 @@ func (s *PushNotificationService) SendToUser(
 			To:        token.ExpoPushToken,
 			Title:     title,
 			Body:      body,
-			Sound:     "default",
+			Sound:     "auction_alert.wav",
 			Priority:  "high",
 			ChannelID: "auction-alerts",
 			Data:      data,

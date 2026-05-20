@@ -44,6 +44,10 @@ func main() {
 
 	authService := services.NewAuthService(userRepo)
 	categoryService := services.NewCategoryService(categoryRepo)
+	notificationService := services.NewNotificationService(notificationRepo)
+	pushTokenService := services.NewPushTokenService(devicePushTokenRepo)
+	pushNotificationService := services.NewPushNotificationService(
+		devicePushTokenRepo)
 	auctionService := services.NewAuctionService(
 		config.DB,
 		auctionRepo,
@@ -52,11 +56,8 @@ func main() {
 		watchlistRepo,
 		categoryRepo,
 		notificationRepo,
+		pushNotificationService,
 	)
-	notificationService := services.NewNotificationService(notificationRepo)
-	pushTokenService := services.NewPushTokenService(devicePushTokenRepo)
-	pushNotificationService := services.NewPushNotificationService(
-		devicePushTokenRepo)
 
 	authHandler := handlers.NewAuthHandler(authService)
 	categoryHandler := handlers.NewCategoryHandler(categoryService)

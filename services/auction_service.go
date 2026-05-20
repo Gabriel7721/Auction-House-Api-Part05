@@ -3,6 +3,7 @@ package services
 import (
 	"errors"
 	"fmt"
+	"log"
 	"main/dto"
 	"main/models"
 	"main/repository"
@@ -13,13 +14,21 @@ import (
 )
 
 type AuctionService struct {
-	db               *gorm.DB
-	auctionRepo      *repository.AuctionRepository
-	productRepo      *repository.ProductRepository
-	bidRepo          *repository.BidRepository
-	watchlistRepo    *repository.WatchlistRepository
-	categoryRepo     *repository.CategoryRepository
-	notificationRepo *repository.NotificationRepository
+	db                      *gorm.DB
+	auctionRepo             *repository.AuctionRepository
+	productRepo             *repository.ProductRepository
+	bidRepo                 *repository.BidRepository
+	watchlistRepo           *repository.WatchlistRepository
+	categoryRepo            *repository.CategoryRepository
+	notificationRepo        *repository.NotificationRepository
+	pushNotificationService *PushNotificationService
+}
+
+type pushNotificationJob struct {
+	UserID uint
+	Title  string
+	Body   string
+	Data   map[string]any
 }
 
 func NewAuctionService(
@@ -30,15 +39,17 @@ func NewAuctionService(
 	watchlistRepo *repository.WatchlistRepository,
 	categoryRepo *repository.CategoryRepository,
 	notificationRepo *repository.NotificationRepository,
+	pushNotificationService *PushNotificationService,
 ) *AuctionService {
 	return &AuctionService{
-		db:               db,
-		auctionRepo:      auctionRepo,
-		productRepo:      productRepo,
-		bidRepo:          bidRepo,
-		watchlistRepo:    watchlistRepo,
-		categoryRepo:     categoryRepo,
-		notificationRepo: notificationRepo,
+		db:                      db,
+		auctionRepo:             auctionRepo,
+		productRepo:             productRepo,
+		bidRepo:                 bidRepo,
+		watchlistRepo:           watchlistRepo,
+		categoryRepo:            categoryRepo,
+		notificationRepo:        notificationRepo,
+		pushNotificationService: pushNotificationService,
 	}
 }
 
@@ -290,6 +301,7 @@ func (s *AuctionService) PlaceBid(
 	var createdBid models.Bid
 	var updatedAuction models.Auction
 	var businessErr error
+	var pushJobs []pushNotificationJob
 
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		auction, err := s.auctionRepo.FindByIDForUpdate(tx, auctionID)
@@ -315,7 +327,7 @@ func (s *AuctionService) PlaceBid(
 		}
 
 		if !now.Before(auction.EndsAt) {
-			if err := s.finalizeLockedAuction(tx, auction); err != nil {
+			if err := s.finalizeLockedAuction(tx, auction, &pushJobs); err != nil {
 				return err
 			}
 
@@ -362,7 +374,7 @@ func (s *AuctionService) PlaceBid(
 		if previousHighestBid != nil && previousHighestBid.UserID != userID {
 			productTitle := auction.Product.Title
 			if productTitle == "" {
-				productTitle = "your watched auction"
+				productTitle = "this auction"
 			}
 
 			outbidNotification := buildNotification(
@@ -378,6 +390,13 @@ func (s *AuctionService) PlaceBid(
 			if err := s.notificationRepo.CreateTx(tx, &outbidNotification); err != nil {
 				return err
 			}
+
+			pushJobs = append(pushJobs, pushNotificationJob{
+				UserID: previousHighestBid.UserID,
+				Title:  outbidNotification.Title,
+				Body:   outbidNotification.Message,
+				Data:   buildAuctionPushData(outbidNotification, auction.ID),
+			})
 		}
 
 		auction.CurrentPrice = input.Amount
@@ -409,6 +428,13 @@ func (s *AuctionService) PlaceBid(
 			if err := s.notificationRepo.CreateTx(tx, &winnerNotification); err != nil {
 				return err
 			}
+
+			pushJobs = append(pushJobs, pushNotificationJob{
+				UserID: userID,
+				Title:  winnerNotification.Title,
+				Body:   winnerNotification.Message,
+				Data:   buildAuctionPushData(winnerNotification, auction.ID),
+			})
 
 			sellerNotification := buildNotification(
 				auction.SellerID,
@@ -444,8 +470,10 @@ func (s *AuctionService) PlaceBid(
 	}
 
 	if businessErr != nil {
+		s.dispatchPushJobs(pushJobs)
 		return nil, nil, businessErr
 	}
+	s.dispatchPushJobs(pushJobs)
 
 	fullAuction, err := s.auctionRepo.FindByID(updatedAuction.ID)
 	if err == nil {
@@ -507,7 +535,9 @@ func (s *AuctionService) GetMyBids(userID uint) ([]models.Bid, error) {
 }
 
 func (s *AuctionService) FinalizeAuctionIfExpired(auctionID uint) error {
-	return s.db.Transaction(func(tx *gorm.DB) error {
+	var pushJobs []pushNotificationJob
+
+	err := s.db.Transaction(func(tx *gorm.DB) error {
 		auction, err := s.auctionRepo.FindByIDForUpdate(tx, auctionID)
 		if err != nil {
 			return err
@@ -522,8 +552,15 @@ func (s *AuctionService) FinalizeAuctionIfExpired(auctionID uint) error {
 			return nil
 		}
 
-		return s.finalizeLockedAuction(tx, auction)
+		return s.finalizeLockedAuction(tx, auction, &pushJobs)
 	})
+
+	if err != nil {
+		return err
+	}
+
+	s.dispatchPushJobs(pushJobs)
+	return nil
 }
 
 func (s *AuctionService) EndExpiredAuctions() error {
@@ -541,7 +578,11 @@ func (s *AuctionService) EndExpiredAuctions() error {
 	return nil
 }
 
-func (s *AuctionService) finalizeLockedAuction(tx *gorm.DB, auction *models.Auction) error {
+func (s *AuctionService) finalizeLockedAuction(
+	tx *gorm.DB,
+	auction *models.Auction,
+	pushJobs *[]pushNotificationJob,
+) error {
 	highestBid, err := s.bidRepo.FindHighestByAuctionIDTx(tx, auction.ID)
 	if err != nil {
 		return err
@@ -575,6 +616,13 @@ func (s *AuctionService) finalizeLockedAuction(tx *gorm.DB, auction *models.Auct
 			return err
 		}
 
+		*pushJobs = append(*pushJobs, pushNotificationJob{
+			UserID: highestBid.UserID,
+			Title:  winnerNotification.Title,
+			Body:   winnerNotification.Message,
+			Data:   buildAuctionPushData(winnerNotification, auction.ID),
+		})
+
 		sellerNotification := buildNotification(
 			auction.SellerID,
 			models.NotificationTypeAuctionEnded,
@@ -588,6 +636,13 @@ func (s *AuctionService) finalizeLockedAuction(tx *gorm.DB, auction *models.Auct
 		if err := s.notificationRepo.CreateTx(tx, &sellerNotification); err != nil {
 			return err
 		}
+
+		*pushJobs = append(*pushJobs, pushNotificationJob{
+			UserID: auction.SellerID,
+			Title:  sellerNotification.Title,
+			Body:   sellerNotification.Message,
+			Data:   buildAuctionPushData(sellerNotification, auction.ID),
+		})
 
 	} else {
 		auction.Product.Status = models.ProductStatusActive
@@ -603,6 +658,12 @@ func (s *AuctionService) finalizeLockedAuction(tx *gorm.DB, auction *models.Auct
 			return err
 		}
 
+		*pushJobs = append(*pushJobs, pushNotificationJob{
+			UserID: auction.SellerID,
+			Title:  sellerNotification.Title,
+			Body:   sellerNotification.Message,
+			Data:   buildAuctionPushData(sellerNotification, auction.ID),
+		})
 	}
 
 	if auction.Product.ID != 0 {
@@ -760,5 +821,42 @@ func buildNotification(
 		Title:   title,
 		Message: message,
 		IsRead:  false,
+	}
+}
+
+func buildAuctionPushData(
+	notification models.Notification,
+	auctionID uint,
+) map[string]any {
+	return map[string]any{
+		"screen":            "auction_detail",
+		"auction_id":        auctionID,
+		"notification_id":   notification.ID,
+		"notification_type": string(notification.Type),
+	}
+}
+
+func (s *AuctionService) dispatchPushJobs(
+	jobs []pushNotificationJob,
+) {
+	if s.pushNotificationService == nil || len(jobs) == 0 {
+		return
+	}
+
+	for _, job := range jobs {
+		err := s.pushNotificationService.SendToUser(
+			job.UserID,
+			job.Title,
+			job.Body,
+			job.Data,
+		)
+
+		if err != nil {
+			log.Printf(
+				"failed to send push notification to user %d: %v",
+				job.UserID,
+				err,
+			)
+		}
 	}
 }
